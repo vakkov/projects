@@ -7,6 +7,7 @@ import torch.optim as optim
 from torch.nn.parallel import DataParallel
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+from collections import OrderedDict
 
 import time
 import numpy as np
@@ -38,6 +39,7 @@ parser.add_argument('--combine_trainval', action="store_true", default=False, he
 parser.add_argument('--pretrained_weights_dir', type=str, default=None, help='pretrained weights')
 
 args = parser.parse_args()
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 if args.gpus is None:
@@ -53,12 +55,24 @@ log_directory = os.path.join(args.exp_dir + '_' + args.dataset_type)
 
 np_ratio = args.batch_sample - 1
 
-dataset, _, _, test_loader = get_data(args.dataset_type, args.split, args.dataset_path, args.h, args.w, 
-                                                args.batch_size, args.num_workers, args.combine_trainval, 
+dataset, _, _, test_loader = get_data(args.dataset_type, args.split, args.dataset_path, args.h, args.w,
+                                                args.batch_size, args.num_workers, args.combine_trainval,
                                                 np_ratio)
 
 # Model (RRID)
-model = Model(last_conv_stride=1, num_stripes=6, local_conv_out_channels=256)
+model = Model(last_conv_stride=1, num_stripes=6, num_classes=751, local_conv_out_channels=256)
+
+if args.pretrained_weights_dir:
+    checkpoint = torch.load(args.pretrained_weights_dir)
+    state_dict = checkpoint.state_dict()
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:]  # remove `module.`
+        new_state_dict[name] = v
+    model.load_state_dict(new_state_dict)
+
+else:
+    model = torch.load(os.path.join(log_directory, 'model.pth'))
 
 # If single gpu
 if len(gpus) < 2:
@@ -67,15 +81,8 @@ if len(gpus) < 2:
 
 # If multi gpus
 if len(gpus) > 1:
-    model = torch.nn.DataParallel(model, range(len(args.gpus))).cuda()
+    model = torch.nn.DataParallel(model).cuda()
 
-
-if args.pretrained_weights_dir:
-    model = torch.load(args.pretrained_weights_dir)
-    
-else:
-    model = torch.load(os.path.join(log_directory, 'model.pth'))
-    
 model.eval()
 batch_time = AverageMeter()
 data_time = AverageMeter()
@@ -92,7 +99,7 @@ with torch.no_grad():
         imgs_flip = torch.flip(imgs, [3])
         final_feat_list, _, _, _, _, = model(Variable(imgs).cuda())
         final_feat_list_flip, _, _, _, _ = model(Variable(imgs_flip).cuda())
-        
+
         for j in range(len(final_feat_list)):
             if j == 0:
                 outputs = (final_feat_list[j].cpu() + final_feat_list_flip[j].cpu())/2
@@ -100,7 +107,7 @@ with torch.no_grad():
                 outputs = torch.cat((outputs, (final_feat_list[j].cpu() + final_feat_list_flip[j].cpu())/2), 1)
 
         outputs = F.normalize(outputs, p=2, dim=1)
-        
+
         for fname, output, pid in zip(fnames, outputs, pids):
             features[fname] = output
             labels[fname] = pid
@@ -114,7 +121,7 @@ with torch.no_grad():
                   'Data {:.3f} ({:.3f})\t'.format(i + 1, len(test_loader),
                                                   batch_time.val, batch_time.avg,
                                                   data_time.val, data_time.avg))
-            
+
 print("Extracing features is finished... Now evaluating begins...")
 
 #Evaluating distance matrix
